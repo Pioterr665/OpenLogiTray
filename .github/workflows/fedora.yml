@@ -1,0 +1,38 @@
+name: Fedora RPM
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['crates/**', 'Cargo.*', 'packaging/fedora/**', 'packaging/linux/**', '.github/workflows/fedora.yml']
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  rpm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build SRPM and RPM in Mock
+        run: |
+          mkdir -p target/fedora/results
+          docker run --rm --privileged \
+            -v "$PWD:/workspace" -w /workspace fedora:45 bash -euxo pipefail -c '
+              dnf install -y rust cargo git ImageMagick rpm-build mock
+              python3 packaging/fedora/prepare-source.py --output target/fedora/sources
+              mock -r fedora-45-x86_64 --isolation=simple --buildsrpm \
+                --spec target/fedora/sources/openlogi.spec --sources target/fedora/sources \
+                --resultdir /workspace/target/fedora/srpm
+              mock -r fedora-45-x86_64 --isolation=simple --rebuild \
+                target/fedora/srpm/*.src.rpm --resultdir /workspace/target/fedora/results
+            '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fedora-rpm
+          path: |
+            target/fedora/srpm/*
+            target/fedora/results/*
+          if-no-files-found: warn

@@ -144,7 +144,6 @@ impl ksni::Tray for Tray {
         menu.push(
             StandardItem {
                 label: rust_i18n::t!("app.quit_openlogi").to_string(),
-                icon_name: "application-exit".to_owned(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.actions.send(Action::Quit);
                 }),
@@ -275,13 +274,13 @@ fn device_rows(snapshot: &AgentSnapshot) -> Vec<TrayRow> {
                 || rust_i18n::t!("device.device").to_string(),
                 prettify_codename,
             );
-            let status = if !device.online {
-                rust_i18n::t!("device.offline").to_string()
-            } else {
+            let status = if device.online {
                 device.battery.as_ref().map_or_else(
                     || rust_i18n::t!("device.connected").to_string(),
                     battery_label,
                 )
+            } else {
+                rust_i18n::t!("device.offline").to_string()
             };
             rows.push(TrayRow {
                 label: format!("{name} — {status}"),
@@ -337,11 +336,14 @@ fn device_rows(snapshot: &AgentSnapshot) -> Vec<TrayRow> {
 }
 
 fn battery_label(battery: &BatteryInfo) -> String {
-    // Charging is the primary status here; firmware may not have a charge
-    // reading yet. The full battery details remain in the device window.
+    // Firmware may report charging before its first usable charge reading.
     match battery.status {
         BatteryStatus::Charging | BatteryStatus::ChargingSlow => {
-            return rust_i18n::t!("device.charging").to_string();
+            let charging = rust_i18n::t!("device.charging");
+            return match battery.percentage {
+                Some(percentage) if percentage > 0 => format!("{percentage}% — {charging}"),
+                _ => charging.to_string(),
+            };
         }
         BatteryStatus::Full => return rust_i18n::t!("device.full").to_string(),
         BatteryStatus::Error => return rust_i18n::t!("device.battery_error").to_string(),
@@ -435,7 +437,7 @@ async fn show_gui(device_key: Option<&str>) {
             }
         }
         Err(error) => {
-            warn!(%error, path = %gui.display(), "could not launch the GUI from the tray")
+            warn!(%error, path = %gui.display(), "could not launch the GUI from the tray");
         }
     }
 }
@@ -516,6 +518,21 @@ mod tests {
     }
 
     #[test]
+    fn charging_preserves_a_measured_percentage() {
+        for status in [BatteryStatus::Charging, BatteryStatus::ChargingSlow] {
+            let battery = BatteryInfo {
+                percentage: Some(73),
+                level: BatteryLevel::Good,
+                status,
+            };
+            assert_eq!(
+                battery_label(&battery),
+                format!("73% — {}", rust_i18n::t!("device.charging"))
+            );
+        }
+    }
+
+    #[test]
     fn absent_percentage_is_not_invented_from_a_coarse_level() {
         let battery = BatteryInfo {
             percentage: None,
@@ -566,10 +583,18 @@ mod tests {
             let icon = &icons[0];
             let pixels = usize::try_from(icon.width * icon.height).unwrap();
             assert_eq!(icon.data.len(), pixels * 4);
-            assert!(icon.data.chunks_exact(4).any(|pixel| pixel[0] > 0));
             assert!(
                 icon.data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[0] > 0)
+            );
+            assert!(
+                icon.data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|pixel| pixel[1..] == [128, 128, 128])
             );
         }

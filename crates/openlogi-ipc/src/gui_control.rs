@@ -127,6 +127,39 @@ pub async fn quit() -> zbus::Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires a private session bus: dbus-run-session -- cargo test -p openlogi-ipc private_bus_lifecycle -- --ignored"]
+    async fn private_bus_lifecycle() {
+        assert!(!show().await.unwrap());
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let connection = serve(commands).await.unwrap();
+        assert!(show().await.unwrap());
+        assert_eq!(
+            received.recv().await.unwrap(),
+            GuiCommand::App(DeeplinkCommand::Show)
+        );
+        assert!(show_device("second-device").await.unwrap());
+        assert_eq!(
+            received.recv().await.unwrap(),
+            GuiCommand::ShowDevice("second-device".to_owned())
+        );
+        let gui = tokio::spawn(async move {
+            assert_eq!(
+                received.recv().await.unwrap(),
+                GuiCommand::App(DeeplinkCommand::Quit)
+            );
+            connection.release_name(service_name()).await.unwrap();
+        });
+        quit().await.unwrap();
+        gui.await.unwrap();
+        assert!(!show().await.unwrap());
+        quit().await.unwrap();
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        let connection = serve(commands).await.unwrap();
+        assert!(show().await.unwrap());
+        connection.release_name(service_name()).await.unwrap();
+    }
+
     #[test]
     fn commands_reach_the_gui_dispatcher_and_closed_dispatchers_reject_them() {
         let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
