@@ -33,8 +33,12 @@ use std::fmt::Write;
 
 use bincode::Options;
 use openlogi_core::app::ForegroundApp;
-use openlogi_core::binding::{ActionRingIcon, ActionRingSlot, KeyCombo};
-use openlogi_core::config::{ConfigRevision, Lighting, ScrollResolution};
+use openlogi_core::binding::{
+    Action, ActionRingIcon, ActionRingSlot, ButtonId, GridKey, GridSlot, KeyCombo, KeypadPage,
+};
+use openlogi_core::config::{
+    ConfigRevision, FlowPeerName, FlowPublicKey, Lighting, ScrollResolution,
+};
 use openlogi_core::device::{
     BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, ChangedOnLight, DeviceInventory,
     DeviceKind, DeviceModelInfo, DeviceTransports, LightCapabilities, LightState, LightValueRange,
@@ -44,19 +48,19 @@ use openlogi_core::hid::{
     BacklightChange, BacklightControls, BacklightDuration, BacklightMode, BacklightState,
     BacklightStatus, Click, DeviceRoute, DisableKeysMask, DisableKeysState, Dpi, DpiCapabilities,
     DpiInfo, EasySwitchHosts, EasySwitchSlot, FnLockState, ForceSensingInfo, HidppFeatureErrorKind,
-    HidppOperation, HostConnection, HostOsInfo, HostOsKind, LightCommand, PasskeyMethod,
-    ReceiverSelector, ReportRate, ReportRateInfo, ScrollReportingTarget, ScrollWheelMode,
-    SmartShiftAutoDisengage, SmartShiftMode, SmartShiftStatus, SmartShiftThreshold, TunableTorque,
-    WriteError,
+    HidppOperation, HostConnection, HostOsInfo, HostOsKind, LightCommand, OnboardMode,
+    OnboardProfile, OnboardState, PasskeyMethod, ProfileIndex, ReceiverSelector, ReportRate,
+    ReportRateInfo, ScrollReportingTarget, ScrollWheelMode, SmartShiftAutoDisengage,
+    SmartShiftMode, SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
 };
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, ActionRingPresentation, AgentRequest,
     AgentResponse, AgentSnapshot, AgentStatus, BacklightObservation, ChosenLight, ClientKind,
-    ConfigReloadError, ForegroundApps, FoundDevice, Identity, InventoryHealth, LockKeyChange,
-    LockKeyObservation, MonitorEvent, Notice, NoticeKind, NoticeObservation, Observation,
-    ObservedLight, PROTOCOL_VERSION, PairingCommandError, PairingFailure, PairingPhase,
-    PairingUpdate, RingObservation, SavedConfig, SavedConfigVerdict, SecureInput,
-    VirtualKeyboardStatus,
+    ConfigReloadError, FlowLinkState, FlowPeerStatus, FlowStatus, ForegroundApps, FoundDevice,
+    Identity, InventoryHealth, LockKeyChange, LockKeyObservation, MonitorEvent, Notice, NoticeKind,
+    NoticeObservation, Observation, ObservedLight, PROTOCOL_VERSION, PairingCommandError,
+    PairingFailure, PairingPhase, PairingUpdate, RingObservation, SavedConfig, SavedConfigVerdict,
+    SecureInput, VirtualKeyboardStatus,
 };
 use succession::{Compat, Run};
 
@@ -112,7 +116,7 @@ fn representative_smartshift_status() -> SmartShiftStatus {
 /// unreleased version and leave this pin alone (`crates/openlogi-ipc/AGENTS.md`).
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 41);
+    assert_eq!(PROTOCOL_VERSION, 44);
 }
 
 #[test]
@@ -443,12 +447,28 @@ fn lock_keys() {
     );
 }
 
+#[test]
+fn switch_host() {
+    assert_wire(
+        &AgentRequest::SwitchHost {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+            host: 2,
+        },
+        "30000846303044434146450102",
+    );
+}
+
 /// A chord crosses the wire as its modifier bits and the key's HID usage.
 #[test]
 fn key_combo_modifier_bits() {
     let combo = |text: &str| text.parse::<KeyCombo>().expect("valid chord");
     assert_wire(&combo("Cmd+L"), "010f");
     assert_wire(&combo("Super+L"), "100f");
+    assert_wire(&combo("Insert"), "0049");
+    assert_wire(&combo("PrintScreen"), "0046");
 }
 
 /// The agent identity is frozen: a helper from any build has to be able to
@@ -516,6 +536,22 @@ fn action_ring_types() {
     assert_wire(&HidppOperation::WriteOsLayout, "12");
     assert_wire(&HidppOperation::ReadReportRate, "13");
     assert_wire(&HidppOperation::WriteReportRate, "14");
+    assert_wire(&HidppOperation::WriteKeyImage, "1d");
+}
+
+/// The keypad page actions are appended `Action` variants, and a later page's
+/// grid slot crosses the wire by its persisted name.
+#[test]
+fn keypad_page_actions_and_slots() {
+    assert_wire(&Action::PreviousKeypadPage, "3b");
+    assert_wire(&Action::NextKeypadPage, "3c");
+    assert_wire(
+        &ButtonId::Grid(GridSlot {
+            page: KeypadPage::new(2).expect("page 2 exists"),
+            key: GridKey::Middle,
+        }),
+        "1070616765323a677269644d6964646c65",
+    );
 }
 
 #[test]
@@ -594,15 +630,46 @@ fn agent_snapshot() {
         foreground: ForegroundApps::default(),
         // Pinned populated in `observed_light` below.
         lights: Vec::new(),
+        // Pinned populated in `flow_status` below.
+        flow: FlowStatus::default(),
     };
-    assert_wire(&snapshot, "010001010705302e362e360100000000000000000000");
+    assert_wire(
+        &snapshot,
+        "010001010705302e362e3601000000000000000000000000",
+    );
 
     // The observation is the snapshot with its generation in front.
     let observed = Observation {
         generation: 3,
         snapshot,
     };
-    assert_wire(&observed, "03010001010705302e362e360100000000000000000000");
+    assert_wire(
+        &observed,
+        "03010001010705302e362e3601000000000000000000000000",
+    );
+}
+
+/// Flow state rides the snapshot. The key travels as its canonical
+/// `ed25519:<hex>` text, so a corrupt key fails to decode.
+#[test]
+fn flow_status() {
+    assert_wire(&FlowLinkState::Connected, "00");
+    assert_wire(&FlowLinkState::Degraded, "01");
+    assert_wire(&FlowLinkState::Lost, "02");
+    assert_wire(&FlowStatus::default(), "0000");
+    assert_wire(
+        &FlowStatus {
+            enabled: true,
+            peers: vec![FlowPeerStatus {
+                name: FlowPeerName::new("desk").expect("valid peer name"),
+                public_key: FlowPublicKey::from_bytes([0xab; 32]),
+                state: FlowLinkState::Degraded,
+            }],
+        },
+        "0101046465736b48656432353531393a\
+         61626162616261626162616261626162616261626162616261626162616261626162616261626162\
+         61626162616261626162616261626162616261626162616201",
+    );
 }
 
 /// The foreground application rides the snapshot, so both halves are pinned:
@@ -709,13 +776,42 @@ fn device_inventory() {
                 pointer_scaling: true,
                 force_sensing: true,
                 disable_keys: false,
+                onboard_profiles: false,
+                button_spy: false,
             }),
             settings_revision: 7,
+            hidpp10: false,
         }],
     }];
     assert_wire(
         &inventory,
-        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b00001010150020001030106323134304c5a0102030400010100fb34b0fb8240000b0101010000010101010100010101010101010007",
+        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b00001010150020001030106323134304c5a0102030400010100fb34b0fb8240000b0101010000010101010100010101010101010000000700",
+    );
+}
+
+#[test]
+fn onboard_state() {
+    assert_wire(&HidppOperation::ReadOnboard, "1c");
+    assert_wire(
+        &AgentRequest::ReadOnboard {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+        },
+        "2f0008463030444341464501",
+    );
+    assert_wire(
+        &OnboardState {
+            mode: OnboardMode::Onboard,
+            active_profile: ProfileIndex::new(5),
+            profiles: vec![OnboardProfile {
+                index: ProfileIndex::new(5).unwrap(),
+                name: Some("Stock".into()),
+                enabled: true,
+            }],
+        },
+        "0001050105010553746f636b01",
     );
 }
 
@@ -1070,6 +1166,7 @@ fn easy_switch_hosts_and_errors() {
     assert_wire(&HidppOperation::ReadHosts, "15");
     assert_wire(&HidppOperation::RenameHost, "16");
     assert_wire(&HidppOperation::WriteLed, "17");
+    assert_wire(&HidppOperation::ChangeHost, "1e");
     assert_wire(&WriteError::HostRenameUnsupported, "16");
     assert_wire(&WriteError::HostSlotEmpty { slot: 2 }, "1702");
     assert_wire(&WriteError::HostNameRejected { max_len: 24 }, "1818");
@@ -1079,6 +1176,13 @@ fn easy_switch_hosts_and_errors() {
             actual: Some("Old".into()),
         },
         "19044465736b01034f6c64",
+    );
+    assert_wire(
+        &WriteError::HostOutOfRange {
+            slot: 3,
+            host_count: 2,
+        },
+        "1f0302",
     );
 }
 
